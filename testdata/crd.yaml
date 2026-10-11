@@ -1,0 +1,45 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.example.com
+spec:
+  group: example.com
+  scope: Namespaced
+  names: {plural: widgets, singular: widget, kind: Widget, shortNames: [wd]}
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [size]
+              properties:
+                size:
+                  type: integer
+                  minimum: 1
+                  maximum: 9007199254740991
+                ratio:
+                  type: number
+                  minimum: 0.0000001
+                  maximum: 1e21
+                  default: 0.5
+                mode:
+                  type: string
+                  enum: [fast, safe, "off"]
+                nested:
+                  type: object
+                  properties:
+                    a:
+                      type: object
+                      properties:
+                        b:
+                          type: object
+                          properties:
+                            c: {type: array, items: {type: string, pattern: '^[a-z]+$'}}
+                x-kubernetes-preserve-unknown-fields: true
+      additionalPrinterColumns:
+        - {name: Size, type: integer, jsonPath: .spec.size}

@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: shop
+  labels:
+    app: web
+    tier: frontend
+  annotations:
+    deployment.kubernetes.io/revision: "3"
+    example.com/enabled: yes
+spec:
+  replicas: 3
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: registry.example.com/shop/web:1.42.0
+          args: ["--port", "8080", "--verbose"]
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          env:
+            - name: CACHE_TTL
+              value: "300"
+            - name: FEATURE_X
+              value: "on"
+          resources:
+            requests: {cpu: 250m, memory: 128Mi}
+            limits:
+              cpu: 1
+              memory: 512Mi
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 2000
+      volumes:
+        - name: config
+          configMap:
+            name: web-config
+            defaultMode: 0644

@@ -1,0 +1,995 @@
+/*
+ * oyl_json.c — YAML documents written as JSON (oyl_parse_json)
+ *
+ * sigs.k8s.io/yaml's YAMLToJSON lets go-yaml v2 decode the YAML into Go
+ * values (merging, expanding aliases), turns the keys into strings, and
+ * has Go's encoding/json write the result, which sorts the keys and
+ * formats numbers and strings its own way. To give the same bytes, a
+ * document's events are read into a flat array of nodes first, so that a
+ * mapping's keys can be sorted and its merges and duplicates settled
+ * before it is written.
+ */
+
+#include "oyl_internal.h"
+#include <locale.h>
+#include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define NONE UINT32_MAX
+
+static bool same(oyl_str a, oyl_str b) {
+    return a.len == b.len && (a.len == 0 || memcmp(a.data, b.data, a.len) == 0);
+}
+
+/* ── Growable buffers ────────────────────────────────────── */
+
+typedef struct {
+    char  *data;
+    size_t len, cap;
+} buffer;
+
+static bool buf_reserve(buffer *b, size_t more) {
+    if (more <= b->cap - b->len) return true;
+    size_t cap = b->cap ? b->cap : 256;
+    while (cap - b->len < more) {
+        if (cap > SIZE_MAX / 2) return false;
+        cap *= 2;
+    }
+    char *data = realloc(b->data, cap);
+    if (!data) return false;
+    b->data = data;
+    b->cap = cap;
+    return true;
+}
+
+static bool buf_put(buffer *b, const void *s, size_t n) {
+    if (!buf_reserve(b, n)) return false;
+    if (n) memcpy(b->data + b->len, s, n);
+    b->len += n;
+    return true;
+}
+
+static bool buf_putc(buffer *b, char c) { return buf_put(b, &c, 1); }
+static bool buf_puts(buffer *b, const char *s) { return buf_put(b, s, strlen(s)); }
+
+/* An integer in decimal, without snprintf */
+static bool buf_uint(buffer *b, uint64_t u, bool neg) {
+    char digits[24];
+    int n = sizeof digits;
+    do digits[--n] = (char)('0' + u % 10); while ((u /= 10) != 0);
+    if (neg) digits[--n] = '-';
+    return buf_put(b, digits + n, sizeof digits - (size_t)n);
+}
+
+static bool buf_int(buffer *b, int64_t i) {
+    return buf_uint(b, i < 0 ? (uint64_t)0 - (uint64_t)i : (uint64_t)i, i < 0);
+}
+
+/* ── The document ────────────────────────────────────────── */
+
+typedef enum { N_SCALAR, N_SEQ, N_MAP, N_ALIAS } node_kind;
+
+typedef struct {
+    node_kind        kind;
+    oyl_scalar_style style;
+    bool             open;      /* a collection not yet closed */
+    oyl_str          text;      /* a scalar's value; an alias's anchor */
+    oyl_str          tag;
+    oyl_mark         mark;
+    uint32_t         first, last, next;   /* children, and the next sibling */
+    uint32_t         target;    /* an alias's node */
+} node;
+
+typedef struct {
+    oyl_str  name;
+    uint32_t node;
+} anchor;
+
+/* A mapping entry while its mapping is settled: the highest priority wins */
+typedef struct {
+    size_t   key_off, key_len;   /* the key's JSON string, in doc.keys */
+    uint64_t prio;
+    uint32_t key, value;         /* nodes */
+    bool     written;            /* in the mapping, not merged into it */
+} entry;
+
+typedef struct {
+    oyl_parser        *p;
+    const oyl_dialect *dialect;   /* the document's, read at its start */
+    const oyl_schema  *schema;
+    unsigned          flags;
+    node             *nodes;
+    uint32_t          len, cap;
+    anchor           *anchors;   /* open addressing; name.data NULL is empty */
+    size_t            acap, alen;
+    buffer            out;
+    buffer            keys;
+    buffer            bin;       /* a decoded !!binary */
+    entry            *entries;   /* a stack: each mapping settles its own range */
+    size_t            elen, ecap;
+    entry            *sort_tmp;  /* merge sort's buffer, reused */
+    size_t            tmp_cap;
+    size_t            decodes, aliased;   /* go-yaml v2's aliasing count */
+    int               alias_depth, depth, max_depth;
+    oyl_status        status;    /* the first error */
+} doc;
+
+static bool fail(doc *d, oyl_status status, oyl_mark mark, const char *fmt, ...) {
+    if (d->status == OYL_OK) {
+        char msg[256];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(msg, sizeof msg, fmt, ap);
+        va_end(ap);
+        oyl_parser_fail(d->p, mark, msg);
+        d->status = status;
+    }
+    return false;
+}
+
+static bool out_of_memory(doc *d) {
+    return fail(d, OYL_ERR_MEMORY, (oyl_mark){ 0, 0, 0 }, "out of memory");
+}
+
+/* A tag as go-yaml writes it in messages: !!int for tag:yaml.org,2002:int */
+static const char *short_tag(oyl_str tag, int *len) {
+    static const char prefix[] = "tag:yaml.org,2002:";
+    size_t plen = sizeof prefix - 1;
+    if (tag.len > plen && memcmp(tag.data, prefix, plen) == 0) {
+        *len = (int)(tag.len - plen);
+        return tag.data + plen;
+    }
+    *len = (int)tag.len;
+    return tag.data;
+}
+
+/* ── Anchors ─────────────────────────────────────────────── */
+
+static size_t name_hash(oyl_str s) {
+    uint64_t h = 14695981039346656037u;
+    for (size_t i = 0; i < s.len; i++) h = (h ^ (unsigned char)s.data[i]) * 1099511628211u;
+    return (size_t)h;
+}
+
+static anchor *anchor_slot(doc *d, oyl_str name) {
+    size_t i = name_hash(name) & (d->acap - 1);
+    while (d->anchors[i].name.data && !same(d->anchors[i].name, name)) i = (i + 1) & (d->acap - 1);
+    return &d->anchors[i];
+}
+
+/* Bind `name` to `n`; a later anchor of the same name replaces it, so an
+ * alias binds to the closest one before it */
+static bool anchor_set(doc *d, oyl_str name, uint32_t n) {
+    if (2 * (d->alen + 1) > d->acap) {
+        size_t cap = d->acap ? d->acap * 2 : 64;
+        anchor *old = d->anchors;
+        size_t old_cap = d->acap;
+        d->anchors = calloc(cap, sizeof *d->anchors);
+        if (!d->anchors) { d->anchors = old; return out_of_memory(d); }
+        d->acap = cap;
+        for (size_t i = 0; i < old_cap; i++)
+            if (old[i].name.data) *anchor_slot(d, old[i].name) = old[i];
+        free(old);
+    }
+    anchor *a = anchor_slot(d, name);
+    if (!a->name.data) d->alen++;
+    *a = (anchor){ name, n };
+    return true;
+}
+
+static uint32_t anchor_get(doc *d, oyl_str name) {
+    if (!d->acap) return NONE;
+    anchor *a = anchor_slot(d, name);
+    return a->name.data ? a->node : NONE;
+}
+
+/* ── Reading a document ──────────────────────────────────── */
+
+static uint32_t add_node(doc *d, node n) {
+    if (d->len == d->cap) {
+        uint32_t cap = d->cap ? d->cap * 2 : 64;
+        node *nodes = cap > d->cap ? realloc(d->nodes, (size_t)cap * sizeof *nodes) : NULL;
+        if (!nodes) { out_of_memory(d); return NONE; }
+        d->nodes = nodes;
+        d->cap = cap;
+    }
+    d->nodes[d->len] = n;
+    return d->len++;
+}
+
+/* Read events up to the end of the next document into d->nodes. At the
+ * end of the stream, sets *end. */
+static oyl_status read_document(doc *d, uint32_t *root, bool *end) {
+    const oyl_event *e;
+    oyl_status st;
+    for (;;) {
+        st = oyl_parse_next(d->p, &e);
+        if (st != OYL_OK) return st;
+        if (e->type == OYL_EVT_STREAM_START) continue;
+        if (e->type == OYL_EVT_STREAM_END || e->type == OYL_EVT_NONE) {
+            *end = true;
+            return OYL_OK;
+        }
+        if (e->type == OYL_EVT_DOC_START) {
+            d->dialect = oyl_parser_document_dialect(d->p);
+            break;
+        }
+        oyl_parser_fail(d->p, e->start, "oyl_parse_json: not at the start of a document");
+        return OYL_ERR_INPUT;
+    }
+
+    uint32_t *stack = NULL;
+    size_t slen = 0, scap = 0;
+    *root = NONE;
+    while ((st = oyl_parse_next(d->p, &e)) == OYL_OK && e->type != OYL_EVT_DOC_END) {
+        if (e->type == OYL_EVT_SEQUENCE_END || e->type == OYL_EVT_MAPPING_END) {
+            if (slen) d->nodes[stack[--slen]].open = false;
+            continue;
+        }
+        node n = { .first = NONE, .last = NONE, .next = NONE, .target = NONE,
+                   .mark = e->start, .tag = e->tag };
+        switch (e->type) {
+        case OYL_EVT_SCALAR:
+            n.kind = N_SCALAR;
+            n.text = e->value;
+            n.style = e->scalar_style;
+            break;
+        case OYL_EVT_ALIAS:
+            n.kind = N_ALIAS;
+            n.text = e->value;
+            n.target = anchor_get(d, e->value);
+            if (n.target == NONE) {
+                fail(d, OYL_ERR_PARSE, e->start, "unknown anchor '%.*s' referenced",
+                     (int)e->value.len, e->value.data);
+            } else if (d->nodes[n.target].open) {
+                fail(d, OYL_ERR_PARSE, e->start, "anchor '%.*s' value contains itself",
+                     (int)e->value.len, e->value.data);
+            }
+            break;
+        case OYL_EVT_SEQUENCE_START:
+        case OYL_EVT_MAPPING_START:
+            n.kind = e->type == OYL_EVT_SEQUENCE_START ? N_SEQ : N_MAP;
+            n.open = true;
+            break;
+        default:
+            continue;
+        }
+        if (d->status != OYL_OK) break;
+        uint32_t i = add_node(d, n);
+        if (i == NONE) break;
+        if (e->anchor.len && !anchor_set(d, e->anchor, i)) break;
+        if (slen) {
+            node *parent = &d->nodes[stack[slen - 1]];
+            if (parent->last == NONE) parent->first = i;
+            else d->nodes[parent->last].next = i;
+            parent->last = i;
+        } else if (*root == NONE) {
+            *root = i;
+        }
+        if (n.kind == N_SEQ || n.kind == N_MAP) {
+            if (slen == scap) {
+                size_t cap = scap ? scap * 2 : 32;
+                uint32_t *s = realloc(stack, cap * sizeof *s);
+                if (!s) { out_of_memory(d); break; }
+                stack = s;
+                scap = cap;
+            }
+            stack[slen++] = i;
+        }
+    }
+    free(stack);
+    return d->status != OYL_OK ? d->status : st;
+}
+
+/* ── Go's number formatting ──────────────────────────────── */
+
+/* Does d1.d2...dn × 10^e read back as `a` (or as its float32)? */
+static bool reads_back(const char *digits, int n, int e, double a, bool single, char point) {
+    char s[48];
+    int k = 0;
+    s[k++] = digits[0];
+    if (n > 1) {
+        s[k++] = point;
+        memcpy(s + k, digits + 1, (size_t)n - 1);
+        k += n - 1;
+    }
+    snprintf(s + k, sizeof s - (size_t)k, "e%d", e);
+    return single ? strtof(s, NULL) == (float)a : strtod(s, NULL) == a;
+}
+
+/* The n-digit decimal next to digits × 10^e, up (+1) or down (-1) */
+static void neighbor(const char *digits, int n, int dir, char *out, int *e) {
+    memcpy(out, digits, (size_t)n);
+    int i = n - 1;
+    if (dir > 0) {
+        while (i >= 0 && out[i] == '9') out[i--] = '0';
+        if (i >= 0) {
+            out[i]++;
+        } else {   /* 99 -> 100: one more digit, so drop the last */
+            out[0] = '1';
+            memset(out + 1, '0', (size_t)n - 1);
+            (*e)++;
+        }
+    } else {
+        while (i >= 0 && out[i] == '0') out[i--] = '9';
+        if (i >= 0) out[i]--;
+        if (out[0] == '0') {   /* 100 -> 099: one digit fewer */
+            memset(out, '9', (size_t)n);
+            (*e)--;
+        }
+    }
+}
+
+/* The shortest decimal digits that read back as `a` (> 0, finite), as Go's
+ * strconv finds them: the closest of that length. Returns their count;
+ * `a` = d1.d2... × 10^*e. Under `single`, for a's float32. */
+static int shortest_digits(double a, bool single, char *digits, int *e) {
+    char point = *localeconv()->decimal_point;
+    double x = single ? (double)(float)a : a;
+    for (int n = 1; n <= 17; n++) {
+        char buf[48];
+        snprintf(buf, sizeof buf, "%.*e", n - 1, x);
+        int k = 0, j = 0;
+        while (buf[j] && buf[j] != 'e') {
+            if (buf[j] >= '0' && buf[j] <= '9') digits[k++] = buf[j];
+            j++;
+        }
+        int ex = buf[j] == 'e' ? atoi(buf + j + 1) : 0;
+        if (reads_back(digits, n, ex, a, single, point)) { *e = ex; return n; }
+        /* the nearest n digits can miss on the narrow side of the interval
+         * that reads back (next to a power of two), where a neighbor fits */
+        char up[24], down[24];
+        int eu = ex, ed = ex;
+        neighbor(digits, n, 1, up, &eu);
+        neighbor(digits, n, -1, down, &ed);
+        bool u = reads_back(up, n, eu, a, single, point);
+        bool dn = reads_back(down, n, ed, a, single, point);
+        if (u || dn) {
+            bool take_up = u;
+            if (u && dn) {   /* both: the closer */
+                char s[48];
+                memcpy(s, up, (size_t)n);
+                snprintf(s + n, sizeof s - (size_t)n, "e%d", eu - n + 1);
+                long double vu = strtold(s, NULL);
+                memcpy(s, down, (size_t)n);
+                snprintf(s + n, sizeof s - (size_t)n, "e%d", ed - n + 1);
+                long double vd = strtold(s, NULL);
+                take_up = fabsl(vu - x) < fabsl(vd - x);
+            }
+            memcpy(digits, take_up ? up : down, (size_t)n);
+            *e = take_up ? eu : ed;
+            return n;
+        }
+    }
+    return 17;   /* not reached: 17 digits always read back */
+}
+
+/* digits × 10^e in plain notation, as Go's 'f' format writes it */
+static bool put_fixed(buffer *b, const char *d, int n, int e) {
+    bool ok = true;
+    if (e >= 0) {
+        if (n <= e + 1) {
+            ok = buf_put(b, d, (size_t)n);
+            for (int i = n; ok && i <= e; i++) ok = buf_putc(b, '0');
+        } else {
+            ok = buf_put(b, d, (size_t)e + 1) && buf_putc(b, '.') &&
+                 buf_put(b, d + e + 1, (size_t)(n - e - 1));
+        }
+    } else {
+        ok = buf_puts(b, "0.");
+        for (int i = 0; ok && i < -e - 1; i++) ok = buf_putc(b, '0');
+        ok = ok && buf_put(b, d, (size_t)n);
+    }
+    return ok;
+}
+
+/* d1[.d2...]e±XX, the exponent padded to two digits */
+static bool put_exponent(buffer *b, const char *d, int n, int e, bool trim_negative) {
+    char ex[16];
+    int ae = e < 0 ? -e : e;
+    if (trim_negative && e < 0 && ae < 10) snprintf(ex, sizeof ex, "e-%d", ae);
+    else snprintf(ex, sizeof ex, "e%c%02d", e < 0 ? '-' : '+', ae);
+    return buf_putc(b, d[0]) && (n == 1 || (buf_putc(b, '.') && buf_put(b, d + 1, (size_t)n - 1))) &&
+           buf_puts(b, ex);
+}
+
+/* A float as encoding/json writes it: the shortest digits, in plain
+ * notation from 1e-6 up to 1e21 and otherwise e notation, as ES6 does */
+static bool put_json_float(buffer *b, double f) {
+    if (f == 0) return buf_puts(b, signbit(f) ? "-0" : "0");
+    char d[24];
+    int e;
+    double a = fabs(f);
+    int n = shortest_digits(a, false, d, &e);
+    if (f < 0 && !buf_putc(b, '-')) return false;
+    if (a < 1e-6 || a >= 1e21) return put_exponent(b, d, n, e, true);
+    return put_fixed(b, d, n, e);
+}
+
+/* A float key as sigs.k8s.io/yaml writes it: strconv.FormatFloat(f, 'g',
+ * -1, 32), with Go's +Inf, -Inf and NaN as YAML's .inf, -.inf and .nan */
+static bool put_float_key(buffer *b, double f) {
+    float g = (float)f;
+    if (isnan(g)) return buf_puts(b, ".nan");
+    if (isinf(g)) return buf_puts(b, g > 0 ? ".inf" : "-.inf");
+    if (g == 0) return buf_puts(b, signbit(g) ? "-0" : "0");
+    char d[24];
+    int e;
+    int n = shortest_digits(fabs((double)g), true, d, &e);
+    if (g < 0 && !buf_putc(b, '-')) return false;
+    if (e < -4 || e >= 6) return put_exponent(b, d, n, e, false);
+    return put_fixed(b, d, n, e);
+}
+
+/* ── Go's string escaping ────────────────────────────────── */
+
+/* The length of the valid UTF-8 sequence at s, as Go's utf8.DecodeRune
+ * accepts them (no overlong forms, surrogates or values past U+10FFFF), or
+ * 0; its code point in *cp */
+static int utf8_seq(const unsigned char *s, size_t n, uint32_t *cp) {
+    unsigned char c = s[0];
+    int len;
+    unsigned char lo = 0x80, hi = 0xBF;
+    if (c >= 0xC2 && c <= 0xDF) len = 2;
+    else if (c >= 0xE0 && c <= 0xEF) {
+        len = 3;
+        if (c == 0xE0) lo = 0xA0;
+        if (c == 0xED) hi = 0x9F;
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        len = 4;
+        if (c == 0xF0) lo = 0x90;
+        if (c == 0xF4) hi = 0x8F;
+    } else {
+        return 0;
+    }
+    if (n < (size_t)len || s[1] < lo || s[1] > hi) return 0;
+    for (int i = 2; i < len; i++)
+        if (s[i] < 0x80 || s[i] > 0xBF) return 0;
+    *cp = len == 2 ? (uint32_t)(c & 0x1F) << 6 | (s[1] & 0x3F)
+        : len == 3 ? (uint32_t)(c & 0x0F) << 12 | (uint32_t)(s[1] & 0x3F) << 6 | (s[2] & 0x3F)
+        : (uint32_t)(c & 0x07) << 18 | (uint32_t)(s[1] & 0x3F) << 12 | (uint32_t)(s[2] & 0x3F) << 6 |
+              (s[3] & 0x3F);
+    return len;
+}
+
+/* The ASCII bytes a JSON string writes as they are */
+static const bool json_plain[128] = {
+    [' '] = 1, ['!'] = 1, ['#'] = 1, ['$'] = 1, ['%'] = 1, ['\''] = 1, ['('] = 1, [')'] = 1,
+    ['*'] = 1, ['+'] = 1, [','] = 1, ['-'] = 1, ['.'] = 1, ['/'] = 1, ['0'] = 1, ['1'] = 1,
+    ['2'] = 1, ['3'] = 1, ['4'] = 1, ['5'] = 1, ['6'] = 1, ['7'] = 1, ['8'] = 1, ['9'] = 1,
+    [':'] = 1, [';'] = 1, ['='] = 1, ['?'] = 1, ['@'] = 1, ['A'] = 1, ['B'] = 1, ['C'] = 1,
+    ['D'] = 1, ['E'] = 1, ['F'] = 1, ['G'] = 1, ['H'] = 1, ['I'] = 1, ['J'] = 1, ['K'] = 1,
+    ['L'] = 1, ['M'] = 1, ['N'] = 1, ['O'] = 1, ['P'] = 1, ['Q'] = 1, ['R'] = 1, ['S'] = 1,
+    ['T'] = 1, ['U'] = 1, ['V'] = 1, ['W'] = 1, ['X'] = 1, ['Y'] = 1, ['Z'] = 1, ['['] = 1,
+    [']'] = 1, ['^'] = 1, ['_'] = 1, ['`'] = 1, ['a'] = 1, ['b'] = 1, ['c'] = 1, ['d'] = 1,
+    ['e'] = 1, ['f'] = 1, ['g'] = 1, ['h'] = 1, ['i'] = 1, ['j'] = 1, ['k'] = 1, ['l'] = 1,
+    ['m'] = 1, ['n'] = 1, ['o'] = 1, ['p'] = 1, ['q'] = 1, ['r'] = 1, ['s'] = 1, ['t'] = 1,
+    ['u'] = 1, ['v'] = 1, ['w'] = 1, ['x'] = 1, ['y'] = 1, ['z'] = 1, ['{'] = 1, ['|'] = 1,
+    ['}'] = 1, ['~'] = 1, [127] = 1,
+};
+
+/* A string as encoding/json writes it, HTML-safe: <, > and & escaped,
+ * U+2028 and U+2029 too, and each invalid UTF-8 byte as U+FFFD. Go 1.27
+ * writes that character itself; older versions wrote the escape \ufffd. */
+static bool put_json_string(buffer *b, const char *str, size_t n) {
+    static const char hex[] = "0123456789abcdef";
+    const unsigned char *s = (const unsigned char *)str;
+    if (!buf_reserve(b, n + 2) || !buf_putc(b, '"')) return false;
+    size_t i = 0;
+    while (i < n) {
+        size_t run = i;
+        while (run < n && s[run] < 0x80 && json_plain[s[run]]) run++;
+        if (run > i && !buf_put(b, s + i, run - i)) return false;
+        i = run;
+        if (i >= n) break;
+        unsigned char c = s[i];
+        if (c < 0x80) {
+            char esc[7] = { '\\', 0 };
+            size_t elen = 2;
+            switch (c) {
+            case '"':  esc[1] = '"'; break;
+            case '\\': esc[1] = '\\'; break;
+            case '\n': esc[1] = 'n'; break;
+            case '\r': esc[1] = 'r'; break;
+            case '\t': esc[1] = 't'; break;
+            case '\b': esc[1] = 'b'; break;
+            case '\f': esc[1] = 'f'; break;
+            default:
+                memcpy(esc + 1, "u00", 3);
+                esc[4] = hex[c >> 4];
+                esc[5] = hex[c & 15];
+                elen = 6;
+            }
+            if (!buf_put(b, esc, elen)) return false;
+            i++;
+            continue;
+        }
+        uint32_t cp;
+        int len = utf8_seq(s + i, n - i, &cp);
+        bool ok = len == 0 ? buf_puts(b, "\xEF\xBF\xBD")
+                : cp == 0x2028 ? buf_puts(b, "\\u2028")
+                : cp == 0x2029 ? buf_puts(b, "\\u2029")
+                : buf_put(b, s + i, (size_t)len);
+        if (!ok) return false;
+        i += len ? (size_t)len : 1;
+    }
+    return buf_putc(b, '"');
+}
+
+/* ── Scalars ─────────────────────────────────────────────── */
+
+/* Go's base64.StdEncoding.DecodeString, which skips \r and \n */
+static bool base64_decode(oyl_str in, buffer *out) {
+    static signed char table[256];
+    static bool ready;
+    if (!ready) {
+        memset(table, -1, sizeof table);
+        const char *alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; i++) table[(unsigned char)alphabet[i]] = (signed char)i;
+        ready = true;
+    }
+    out->len = 0;
+    int quad[4], q = 0, pad = 0;
+    for (size_t i = 0; i < in.len; i++) {
+        unsigned char c = (unsigned char)in.data[i];
+        if (c == '\r' || c == '\n') continue;
+        if (pad) {   /* only padding may follow padding, and at most two */
+            if (c != '=' || q == 0 || ++pad > 2) return false;
+            quad[q++] = 0;
+        } else if (c == '=') {
+            if (q < 2) return false;
+            pad = 1;
+            quad[q++] = 0;
+        } else {
+            if (table[c] < 0) return false;
+            quad[q++] = table[c];
+        }
+        if (q == 4) {
+            unsigned char bytes[3] = { (unsigned char)(quad[0] << 2 | quad[1] >> 4),
+                                       (unsigned char)(quad[1] << 4 | quad[2] >> 2),
+                                       (unsigned char)(quad[2] << 6 | quad[3]) };
+            if (!buf_put(out, bytes, 3 - (size_t)pad)) return false;
+            q = 0;
+            if (pad) pad = 3;   /* the end: nothing may follow */
+        }
+    }
+    return q == 0;
+}
+
+/* A scalar node's value, with a !!binary decoded into d->bin */
+static bool scalar_value(doc *d, uint32_t i, oyl_value *v) {
+    const node *n = &d->nodes[i];
+    if (same(n->tag, OYL_TAG_BINARY)) {
+        if (!base64_decode(n->text, &d->bin))
+            return fail(d, OYL_ERR_PARSE, n->mark, "!!binary value contains invalid base64 data");
+        *v = (oyl_value){ .kind = OYL_VALUE_STR, .as = { .s = { d->bin.data, d->bin.len } } };
+        return true;
+    }
+    oyl_status st = oyl_schema_value_of(d->schema, n->text, n->style, n->tag, v);
+    if (st == OYL_ERR_PARSE) {
+        int tl;
+        const char *t = short_tag(n->tag, &tl);
+        return fail(d, OYL_ERR_PARSE, n->mark, "cannot decode `%.*s` as !!%.*s",
+                    (int)n->text.len, n->text.data, tl, t);
+    }
+    if (st != OYL_OK) return fail(d, st, n->mark, "out of memory");
+    return true;
+}
+
+static bool write_scalar(doc *d, uint32_t i) {
+    oyl_value v;
+    if (!scalar_value(d, i, &v)) return false;
+    buffer *b = &d->out;
+    bool ok;
+    switch (v.kind) {
+    case OYL_VALUE_NULL:
+        ok = buf_puts(b, "null");
+        break;
+    case OYL_VALUE_BOOL:
+        ok = buf_puts(b, v.as.b ? "true" : "false");
+        break;
+    case OYL_VALUE_INT:
+        ok = buf_int(b, v.as.i);
+        break;
+    case OYL_VALUE_UINT:
+        ok = buf_uint(b, v.as.u, false);
+        break;
+    case OYL_VALUE_FLOAT:
+        if (isnan(v.as.f) || isinf(v.as.f))
+            return fail(d, OYL_ERR_PARSE, d->nodes[i].mark, "json: unsupported value: %s",
+                        isnan(v.as.f) ? "NaN" : v.as.f > 0 ? "+Inf" : "-Inf");
+        ok = put_json_float(b, v.as.f);
+        break;
+    default:
+        ok = put_json_string(b, v.as.s.data, v.as.s.len);
+        break;
+    }
+    return ok || out_of_memory(d);
+}
+
+/* ── Writing ─────────────────────────────────────────────── */
+
+/* go-yaml v2's check, made at each node it decodes: past 1,000 nodes and
+ * 100 through aliases, too large a share through aliases fails */
+static bool count_decode(doc *d, uint32_t i) {
+    d->decodes++;
+    if (d->alias_depth > 0) d->aliased++;
+    if (d->aliased > 100 && d->decodes > 1000) {
+        double ratio = d->decodes <= 400000    ? 0.99
+                     : d->decodes >= 4000000   ? 0.10
+                     : 0.99 - 0.89 * ((double)(d->decodes - 400000) / 3600000.0);
+        if ((double)d->aliased / (double)d->decodes > ratio)
+            return fail(d, OYL_ERR_LIMIT, d->nodes[i].mark, "document contains excessive aliasing");
+    }
+    return true;
+}
+
+static bool enter(doc *d, uint32_t i) {
+    if (d->max_depth && ++d->depth > d->max_depth)
+        return fail(d, OYL_ERR_LIMIT, d->nodes[i].mark, "nesting depth limit exceeded");
+    if (!d->max_depth) d->depth++;
+    return true;
+}
+
+static bool write_node(doc *d, uint32_t i);
+
+/* A key's JSON string, appended to d->keys: go-yaml v2 decodes the key and
+ * sigs.k8s.io/yaml makes it a string */
+static bool key_string(doc *d, uint32_t k, size_t *off, size_t *len) {
+    if (!count_decode(d, k)) return false;
+    uint32_t i = k;
+    int aliases = 0;
+    while (d->nodes[i].kind == N_ALIAS) {
+        d->alias_depth++;
+        aliases++;
+        i = d->nodes[i].target;
+        if (!count_decode(d, i)) { d->alias_depth -= aliases; return false; }
+    }
+    d->alias_depth -= aliases;
+    const node *n = &d->nodes[i];
+    if (n->kind != N_SCALAR)
+        return fail(d, OYL_ERR_PARSE, d->nodes[k].mark, "invalid map key: a %s",
+                    n->kind == N_MAP ? "mapping" : "sequence");
+    oyl_value v;
+    if (!scalar_value(d, i, &v)) return false;
+    buffer *b = &d->keys;
+    size_t start = b->len;
+    bool ok;
+    switch (v.kind) {
+    case OYL_VALUE_NULL:
+        return fail(d, OYL_ERR_PARSE, d->nodes[k].mark, "unsupported map key: null");
+    case OYL_VALUE_UINT:   /* sigs.k8s.io/yaml takes int, int64, float64, bool and string keys */
+        return fail(d, OYL_ERR_PARSE, d->nodes[k].mark, "unsupported map key of type: uint64");
+    case OYL_VALUE_BOOL:
+        ok = buf_puts(b, v.as.b ? "true" : "false");
+        break;
+    case OYL_VALUE_INT:
+        ok = buf_int(b, v.as.i);
+        break;
+    case OYL_VALUE_FLOAT:
+        ok = put_float_key(b, v.as.f);
+        break;
+    default:
+        ok = buf_put(b, v.as.s.data, v.as.s.len);
+        break;
+    }
+    if (!ok) return out_of_memory(d);
+    *off = start;
+    *len = b->len - start;
+    return true;
+}
+
+static bool push_entry(doc *d, entry e) {
+    if (d->elen == d->ecap) {
+        size_t cap = d->ecap ? d->ecap * 2 : 64;
+        entry *es = realloc(d->entries, cap * sizeof *es);
+        if (!es) return out_of_memory(d);
+        d->entries = es;
+        d->ecap = cap;
+    }
+    d->entries[d->elen++] = e;
+    return true;
+}
+
+/* Is key node k a merge key? As go-yaml v2 sees it: << untagged and plain,
+ * or tagged !!merge. A schema on the parser may have tagged it already. */
+static bool is_merge(doc *d, uint32_t k) {
+    const node *n = &d->nodes[k];
+    if (n->kind != N_SCALAR || n->text.len != 2 || memcmp(n->text.data, "<<", 2) != 0) return false;
+    if (same(n->tag, OYL_TAG_MERGE)) return true;
+    if (n->style != OYL_SCALAR_PLAIN) return false;
+    if (n->tag.len == 0) return true;
+    const oyl_schema *ps = oyl_parser_schema(d->p);
+    return ps && same(n->tag, oyl_schema_resolve(ps, n->text, OYL_SCALAR_PLAIN));
+}
+
+static bool collect(doc *d, uint32_t map, uint64_t *counter, bool written);
+
+/* The mapping a merge item stands for: a mapping, or an alias to one */
+static bool merge_item(doc *d, uint32_t item, uint32_t *map, bool *alias) {
+    *alias = d->nodes[item].kind == N_ALIAS;
+    *map = *alias ? d->nodes[item].target : item;
+    if (d->nodes[*map].kind != N_MAP)
+        return fail(d, OYL_ERR_PARSE, d->nodes[item].mark,
+                    "map merge requires map or sequence of maps as the value");
+    return true;
+}
+
+/* Merge items in go-yaml v2's order, each overriding what came before:
+ * a sequence's items from the last, as earlier ones take precedence */
+static bool merge_ordered(doc *d, uint32_t value, uint64_t *counter) {
+    uint32_t items[1] = { value };
+    uint32_t *list = items;
+    size_t count = 1;
+    uint32_t *seq = NULL;
+    if (d->nodes[value].kind == N_SEQ) {
+        if (!count_decode(d, value)) return false;
+        count = 0;
+        for (uint32_t c = d->nodes[value].first; c != NONE; c = d->nodes[c].next) count++;
+        seq = malloc((count ? count : 1) * sizeof *seq);
+        if (!seq) return out_of_memory(d);
+        size_t j = 0;
+        for (uint32_t c = d->nodes[value].first; c != NONE; c = d->nodes[c].next) seq[j++] = c;
+        list = seq;
+    }
+    bool ok = true;
+    for (size_t j = count; ok && j-- > 0;) {
+        uint32_t map;
+        bool alias;
+        ok = merge_item(d, list[j], &map, &alias);
+        if (!ok) break;
+        if (alias) {
+            ok = count_decode(d, list[j]);
+            d->alias_depth++;
+        }
+        ok = ok && count_decode(d, map) && collect(d, map, counter, false);
+        if (alias) d->alias_depth--;
+    }
+    free(seq);
+    return ok;
+}
+
+/* YAML's merge, in collect_merged: keys written in a mapping win, then the
+ * merges in order, a sequence's items in order. Each merged mapping is
+ * settled first (its own merges included), then fills the keys not yet
+ * set, at a lower priority than everything before it. */
+static bool settle(doc *d, size_t base, size_t *count);
+
+static bool merge_by_yaml(doc *d, uint32_t value, uint64_t *group) {
+    uint32_t single = value;
+    uint32_t first = d->nodes[value].kind == N_SEQ ? d->nodes[value].first : single;
+    bool is_seq = d->nodes[value].kind == N_SEQ;
+    if (is_seq && !count_decode(d, value)) return false;
+    for (uint32_t item = first; item != NONE; item = is_seq ? d->nodes[item].next : NONE) {
+        uint32_t map;
+        bool alias;
+        if (!merge_item(d, item, &map, &alias)) return false;
+        if (alias) {
+            if (!count_decode(d, item)) return false;
+            d->alias_depth++;
+        }
+        size_t base = d->elen;
+        uint64_t counter = 0;
+        bool ok = count_decode(d, map) && collect(d, map, &counter, false);
+        size_t count = 0;
+        ok = ok && settle(d, base, &count);
+        if (alias) d->alias_depth--;
+        if (!ok) return false;
+        uint64_t prio = (uint64_t)1 << 62;
+        prio = *group < prio ? prio - ++*group : 0;
+        for (size_t j = base; j < base + count; j++) {
+            d->entries[j].prio = prio;
+            d->entries[j].written = false;
+        }
+        d->elen = base + count;
+    }
+    return true;
+}
+
+/* Push mapping `map`'s entries onto d->entries with rising priorities */
+static bool collect(doc *d, uint32_t map, uint64_t *counter, bool written) {
+    bool merging = (d->flags & OYL_JSON_MERGE) != 0;
+    bool ordered = (d->flags & OYL_JSON_MERGE_ORDER) != 0;
+    uint64_t group = 0;
+    uint32_t pending_merges[64];
+    size_t npending = 0;
+    for (uint32_t k = d->nodes[map].first; k != NONE; k = d->nodes[d->nodes[k].next].next) {
+        uint32_t v = d->nodes[k].next;
+        if (v == NONE) break;
+        if (merging && is_merge(d, k)) {
+            if (ordered) {
+                if (!merge_ordered(d, v, counter)) return false;
+            } else if (npending < sizeof pending_merges / sizeof pending_merges[0]) {
+                pending_merges[npending++] = v;
+            } else {
+                return fail(d, OYL_ERR_LIMIT, d->nodes[k].mark, "too many merge keys in one mapping");
+            }
+            continue;
+        }
+        size_t off, len;
+        if (!key_string(d, k, &off, &len)) return false;
+        uint64_t prio = ordered || !merging ? ++*counter : ((uint64_t)1 << 63) + ++*counter;
+        if (!push_entry(d, (entry){ off, len, prio, k, v, written })) return false;
+    }
+    for (size_t j = 0; j < npending; j++)
+        if (!merge_by_yaml(d, pending_merges[j], &group)) return false;
+    return true;
+}
+
+/* Compare entries by key, then priority */
+static int entry_cmp(const doc *d, const entry *a, const entry *b) {
+    size_t n = a->key_len < b->key_len ? a->key_len : b->key_len;
+    int c = n ? memcmp(d->keys.data + a->key_off, d->keys.data + b->key_off, n) : 0;
+    if (c) return c;
+    if (a->key_len != b->key_len) return a->key_len < b->key_len ? -1 : 1;
+    return a->prio < b->prio ? -1 : a->prio > b->prio;
+}
+
+static void sort_entries(const doc *d, entry *e, entry *tmp, size_t n) {
+    if (n < 2) return;
+    if (n <= 16) {   /* insertion sort */
+        for (size_t i = 1; i < n; i++) {
+            entry x = e[i];
+            size_t j = i;
+            while (j > 0 && entry_cmp(d, &e[j - 1], &x) > 0) { e[j] = e[j - 1]; j--; }
+            e[j] = x;
+        }
+        return;
+    }
+    size_t h = n / 2;
+    sort_entries(d, e, tmp, h);
+    sort_entries(d, e + h, tmp, n - h);
+    size_t i = 0, j = h, k = 0;
+    while (i < h && j < n) tmp[k++] = entry_cmp(d, &e[j], &e[i]) < 0 ? e[j++] : e[i++];
+    while (i < h) tmp[k++] = e[i++];
+    while (j < n) tmp[k++] = e[j++];
+    memcpy(e, tmp, n * sizeof *e);
+}
+
+/* Sort the entries from `base` by key and keep the winner of each key.
+ * Under OYL_JSON_STRICT a key set twice fails: by keys written in one
+ * mapping, or, in go-yaml v2's merge order, by a merge too. */
+static bool settle(doc *d, size_t base, size_t *count) {
+    size_t n = d->elen - base;
+    *count = 0;
+    if (n == 0) return true;
+    if (n > 16 && n > d->tmp_cap) {   /* insertion sort needs no buffer */
+        entry *tmp = realloc(d->sort_tmp, n * sizeof *tmp);
+        if (!tmp) return out_of_memory(d);
+        d->sort_tmp = tmp;
+        d->tmp_cap = n;
+    }
+    entry *e = d->entries + base;
+    sort_entries(d, e, d->sort_tmp, n);
+    bool strict = (d->flags & OYL_JSON_STRICT) != 0;
+    bool any_counts = (d->flags & OYL_JSON_MERGE_ORDER) != 0;
+    size_t out = 0;
+    for (size_t i = 0; i < n;) {
+        size_t j = i + 1, written = e[i].written;
+        while (j < n && e[j].key_len == e[i].key_len &&
+               (e[i].key_len == 0 ||
+                memcmp(d->keys.data + e[j].key_off, d->keys.data + e[i].key_off, e[i].key_len) == 0))
+            written += e[j++].written;
+        if (strict && (any_counts ? j - i > 1 : written > 1))
+            return fail(d, OYL_ERR_PARSE, d->nodes[e[j - 1].key].mark, "key \"%.*s\" already set in map",
+                        (int)e[i].key_len, d->keys.data + e[i].key_off);
+        if (any_counts && written && !e[j - 1].written) {
+            /* a merge won over a key written in the mapping: go-yaml v2's
+             * order, but every other YAML reader keeps the written key */
+            size_t w = j - 1;
+            while (w > i && !e[w].written) w--;
+            char msg[256];
+            snprintf(msg, sizeof msg, "key \"%.*s\" is overridden by a later << merge, as go-yaml v2 "
+                     "reads it; YAML's merge keeps it", (int)(e[w].key_len > 100 ? 100 : e[w].key_len),
+                     d->keys.data + e[w].key_off);
+            oyl_parser_warn(d->p, OYL_WARN_MERGE_ORDER, d->nodes[e[w].key].mark, msg);
+        }
+        e[out++] = e[j - 1];   /* the highest priority */
+        i = j;
+    }
+    *count = out;
+    return true;
+}
+
+static bool write_mapping(doc *d, uint32_t m) {
+    if (!enter(d, m)) return false;
+    size_t base = d->elen, kbase = d->keys.len;
+    uint64_t counter = 0;
+    size_t count = 0;
+    if (!collect(d, m, &counter, true) || !settle(d, base, &count)) return false;
+    d->elen = base + count;
+    if (!buf_putc(&d->out, '{')) return out_of_memory(d);
+    for (size_t j = 0; j < count; j++) {
+        entry e = d->entries[base + j];
+        if ((j && !buf_putc(&d->out, ',')) ||
+            !put_json_string(&d->out, d->keys.data + e.key_off, e.key_len) ||
+            !buf_putc(&d->out, ':'))
+            return out_of_memory(d);
+        if (!write_node(d, e.value)) return false;
+    }
+    if (!buf_putc(&d->out, '}')) return out_of_memory(d);
+    d->elen = base;
+    d->keys.len = kbase;
+    d->depth--;
+    return true;
+}
+
+static bool write_node(doc *d, uint32_t i) {
+    if (!count_decode(d, i)) return false;
+    const node *n = &d->nodes[i];
+    switch (n->kind) {
+    case N_ALIAS: {
+        d->alias_depth++;
+        bool ok = write_node(d, n->target);
+        d->alias_depth--;
+        return ok;
+    }
+    case N_SCALAR:
+        return write_scalar(d, i);
+    case N_SEQ: {
+        if (!enter(d, i)) return false;
+        if (!buf_putc(&d->out, '[')) return out_of_memory(d);
+        for (uint32_t c = n->first; c != NONE; c = d->nodes[c].next) {
+            if (c != n->first && !buf_putc(&d->out, ',')) return out_of_memory(d);
+            if (!write_node(d, c)) return false;
+        }
+        if (!buf_putc(&d->out, ']')) return out_of_memory(d);
+        d->depth--;
+        return true;
+    }
+    case N_MAP:
+        return write_mapping(d, i);
+    }
+    return false;
+}
+
+/* ── The entry point ─────────────────────────────────────── */
+
+oyl_status oyl_parse_json(oyl_parser *p, const oyl_schema *schema, unsigned flags,
+                          oyl_str *json) {
+    if (!p || !json) return OYL_ERR_INPUT;
+    *json = (oyl_str){ NULL, 0 };
+    doc d = { .p = p, .schema = schema, .flags = flags,
+              .max_depth = oyl_parser_depth_limit(p) };
+    /* both buffers exist even when nothing is written to them, so that
+     * offsets into them are never taken from NULL */
+    d.entries = malloc(64 * sizeof *d.entries);
+    d.ecap = d.entries ? 64 : 0;
+    if (!d.entries || !buf_reserve(&d.out, 256) || !buf_reserve(&d.keys, 256)) {
+        free(d.entries);
+        free(d.out.data);
+        free(d.keys.data);
+        return OYL_ERR_MEMORY;
+    }
+    uint32_t root = NONE;
+    bool end = false;
+    oyl_status st = read_document(&d, &root, &end);
+    if (st == OYL_OK && !end && !schema) {   /* the document's dialect */
+        d.schema = oyl_dialect_schema(d.dialect);
+        oyl_merge_order m = oyl_dialect_merge(d.dialect);
+        d.flags = (flags & ~(unsigned)(OYL_JSON_MERGE | OYL_JSON_MERGE_ORDER)) |
+                  (m == OYL_MERGE_YAML ? OYL_JSON_MERGE
+                   : m == OYL_MERGE_ORDERED ? OYL_JSON_MERGE | OYL_JSON_MERGE_ORDER : 0);
+    }
+    if (st == OYL_OK && !end) {
+        bool ok = root == NONE ? buf_puts(&d.out, "null") || out_of_memory(&d)
+                               : write_node(&d, root);
+        if (ok) {
+            char *s = oyl_arena_dup(oyl_parser_arena(p), d.out.data ? d.out.data : "", d.out.len);
+            if (s) *json = (oyl_str){ s, d.out.len };
+            else out_of_memory(&d);
+        }
+        st = d.status;
+    }
+    free(d.nodes);
+    free(d.anchors);
+    free(d.out.data);
+    free(d.keys.data);
+    free(d.bin.data);
+    free(d.entries);
+    free(d.sort_tmp);
+    return st;
+}

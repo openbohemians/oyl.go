@@ -1,0 +1,1 @@
+bbde00e396b43faba697591a93e2a24c64981c07 2026-10-11 Faster JSON writing: skip rules by first byte, no event per scalar

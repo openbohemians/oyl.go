@@ -1,0 +1,2 @@
+# Go fuzzing corpus written by go test -fuzz
+testdata/fuzz/

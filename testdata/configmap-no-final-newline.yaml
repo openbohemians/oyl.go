@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-config
+data:
+  app.properties: |
+    cache.ttl=300
+    feature.x=on
+  motd: >
+    Welcome to
+    the shop.
+
+    Enjoy.
+  nginx.conf: |
+    server {
+      listen 8080;
+    }
