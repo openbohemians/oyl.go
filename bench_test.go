@@ -50,6 +50,27 @@ func benchmark(b *testing.B, docs [][]byte, convert func([]byte) ([]byte, error)
 	}
 }
 
+// The YAML files under OYL_BENCH, to measure your own manifests
+func dirDocuments(b *testing.B) [][]byte {
+	dir := os.Getenv("OYL_BENCH")
+	if dir == "" {
+		b.Skip("set OYL_BENCH to a directory of YAML files")
+	}
+	var docs [][]byte
+	filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && (filepath.Ext(path) == ".yaml" || filepath.Ext(path) == ".yml") {
+			if in, err := os.ReadFile(path); err == nil {
+				docs = append(docs, in)
+			}
+		}
+		return nil
+	})
+	return docs
+}
+
+func BenchmarkOylDir(b *testing.B)  { benchmark(b, dirDocuments(b), YAMLToJSON) }
+func BenchmarkSigsDir(b *testing.B) { benchmark(b, dirDocuments(b), sigsyaml.YAMLToJSON) }
+
 func BenchmarkOylBig(b *testing.B)  { benchmark(b, [][]byte{bigDocument()}, YAMLToJSON) }
 func BenchmarkSigsBig(b *testing.B) { benchmark(b, [][]byte{bigDocument()}, sigsyaml.YAMLToJSON) }
 func BenchmarkOylManifests(b *testing.B) {

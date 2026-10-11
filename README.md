@@ -1,8 +1,8 @@
 # oyl.go
 
 Go bindings for [Oyl](https://github.com/openbohemians/oyl), the optimized
-YAML library: YAML to JSON the way Kubernetes reads it, about five to six
-times as fast.
+YAML library: YAML to JSON the way Kubernetes reads it, about seven times
+as fast on real manifests.
 
 ```go
 import "github.com/openbohemians/oyl.go"
@@ -56,13 +56,16 @@ Where they can differ:
 
 ```sh
 go test -run '^$' -bench .
+OYL_BENCH=path/to/manifests go test -run '^$' -bench Dir   # your own YAML
 ```
 
-| Input | oyl | sigs.k8s.io/yaml |
-|---|---|---|
-| small manifests (`testdata/`) | 69 MB/s | 11.5 MB/s |
-| a 1 MB CRD-like document | 94 MB/s | 18 MB/s |
+| Input | oyl | sigs.k8s.io/yaml | |
+|---|---|---|---|
+| 866 public Kubernetes documents, 7.3 MB (the comparison set above) | 347 MB/s | 47 MB/s | 7.3x |
+| small manifests (`testdata/`, a few hundred bytes each) | 67 MB/s | 11.8 MB/s | 5.7x |
+| a synthetic 1 MB CRD, all short keys | 93 MB/s | 18 MB/s | 5.2x |
 
+Small documents spend more of their time on the fixed cost of a call.
 (Intel Core Ultra 7 155H, Go 1.27.)
 
 ## Updating Oyl

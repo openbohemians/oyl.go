@@ -467,10 +467,18 @@ static bool word_eq(const char *pattern, size_t plen, oyl_str text, bool icase) 
     return true;
 }
 
-/* A word rule can't match text of another length: checked inline, before
- * the call, since most of a schema's rules are words */
+/* Rules that can't match, ruled out inline before the call: a word of
+ * another length or first byte (most of a schema's rules are words), or a
+ * number or timestamp for text that starts like neither */
 static inline bool word_misses(const oyl_schema_rule *r, oyl_str text) {
-    return r->kind <= RULE_WORD_ICASE && text.len != r->plen;
+    if (r->kind <= RULE_WORD_ICASE)
+        return text.len != r->plen ||
+               (r->kind == RULE_WORD && text.len && text.data[0] != r->pattern[0]);
+    if (r->kind <= RULE_TIMESTAMP && text.len) {
+        unsigned char c = (unsigned char)text.data[0];
+        return !((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.');
+    }
+    return false;
 }
 
 /* Does rule `r` accept `text`? If so and `out` isn't NULL, fill in the

@@ -1,1 +1,1 @@
-bbde00e396b43faba697591a93e2a24c64981c07 2026-10-11 Faster JSON writing: skip rules by first byte, no event per scalar
+e90ac2a152e5910e9573aab8a0227f87e2bb4740 2026-10-11 JSON writer: keys point into the document, strings scanned 16 bytes at a time

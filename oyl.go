@@ -5,7 +5,8 @@
 // the function behind kubectl and client-go's YAML decoding: go-yaml v2's
 // types (yes and on are true, 0777 is octal), its merge-key order, keys
 // sorted, numbers and strings as Go's encoding/json writes them. Oyl does
-// it in C, in one call per document, about six times as fast.
+// it in C, in one call per document, about seven times as fast on real
+// manifests.
 //
 // Oyl's C sources are vendored, so building needs only a C compiler (cgo).
 package oyl
