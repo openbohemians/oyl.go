@@ -18,9 +18,8 @@ float), its merge-key order, the first document only, keys sorted, and
 numbers and strings written as Go's `encoding/json` writes them. They can
 replace `sigs.k8s.io/yaml`'s anywhere it converts YAML to JSON.
 
-**Status:** this needs Oyl 1.1 (its dialects and `oyl_parse_json`), not
-yet released; until then it vendors Oyl's development branch, and
-`c/COMMIT` says which commit. Tags of this module start with Oyl 1.1.
+**Status:** it vendors Oyl 1.2.0, the first release with the dialects and
+`oyl_parse_json` this needs; `c/COMMIT` names the commit.
 
 Oyl does the conversion in C, in one call per document. Its sources are
 vendored in `c/`, so building needs only a C compiler: cgo must be on
@@ -61,9 +60,9 @@ OYL_BENCH=path/to/manifests go test -run '^$' -bench Dir   # your own YAML
 
 | Input | oyl | sigs.k8s.io/yaml | |
 |---|---|---|---|
-| 866 public Kubernetes documents, 7.3 MB (the comparison set above) | 347 MB/s | 47 MB/s | 7.3x |
-| small manifests (`testdata/`, a few hundred bytes each) | 67 MB/s | 11.8 MB/s | 5.7x |
-| a synthetic 1 MB CRD, all short keys | 93 MB/s | 18 MB/s | 5.2x |
+| 866 public Kubernetes documents, 7.3 MB (the comparison set above) | 333 MB/s | 48 MB/s | 7.0x |
+| small manifests (`testdata/`, a few hundred bytes each) | 81 MB/s | 13.4 MB/s | 6.1x |
+| a synthetic 1 MB CRD, all short keys | 124 MB/s | 16 MB/s | 7.7x |
 
 Small documents spend more of their time on the fixed cost of a call.
 (Intel Core Ultra 7 155H, Go 1.27.)
@@ -75,7 +74,7 @@ came from. From a checkout of Oyl:
 
 ```sh
 scripts/sync-oyl.sh path/to/oyl          # its committed HEAD
-scripts/sync-oyl.sh path/to/oyl v1.1.0   # or a release tag
+scripts/sync-oyl.sh path/to/oyl v1.2.0   # or a release tag
 go test
 ```
 
