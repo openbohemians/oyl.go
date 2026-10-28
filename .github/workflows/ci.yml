@@ -23,5 +23,7 @@ jobs:
         run: go test -race ./...
       - name: Fuzz for a minute
         run: go test -run '^$' -fuzz FuzzYAMLToJSON -fuzztime 60s -parallel 1 .
+      - name: Fuzz the round trip for a minute
+        run: go test -run '^$' -fuzz FuzzRoundTrip -fuzztime 60s -parallel 1 .
       - name: Benchmarks run
         run: go test -run '^$' -bench . -benchtime 1x .

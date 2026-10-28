@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	sigsyaml "sigs.k8s.io/yaml"
+	yamlv3 "sigs.k8s.io/yaml/goyaml.v3"
 )
 
 // A large CRD-like document, as the big manifests in real clusters are
@@ -79,3 +80,60 @@ func BenchmarkOylManifests(b *testing.B) {
 func BenchmarkSigsManifests(b *testing.B) {
 	benchmark(b, testdataDocuments(b), sigsyaml.YAMLToJSON)
 }
+
+// Decoding into interface values, and writing them back: Oyl against
+// go-yaml v3 and sigs.k8s.io/yaml (go-yaml v2, then encoding/json).
+
+func benchmarkDecode(b *testing.B, docs [][]byte, unmarshal func([]byte, any) error) {
+	benchmark(b, docs, func(in []byte) ([]byte, error) {
+		var v any
+		return nil, unmarshal(in, &v)
+	})
+}
+
+func benchmarkEncode(b *testing.B, docs [][]byte, marshal func(any) ([]byte, error)) {
+	var values []any
+	var kept [][]byte
+	for _, d := range docs {
+		var v any
+		if Unmarshal(d, &v, WithDialect(GoYAML2)) == nil {
+			values = append(values, v)
+			kept = append(kept, d)
+		}
+	}
+	i := 0
+	benchmark(b, kept, func([]byte) ([]byte, error) {
+		v := values[i%len(values)]
+		i++
+		return marshal(v)
+	})
+}
+
+func oylUnmarshal(in []byte, v any) error { return Unmarshal(in, v) }
+
+func BenchmarkDecodeOylBig(b *testing.B) { benchmarkDecode(b, [][]byte{bigDocument()}, oylUnmarshal) }
+func BenchmarkDecodeV3Big(b *testing.B) {
+	benchmarkDecode(b, [][]byte{bigDocument()}, yamlv3.Unmarshal)
+}
+func BenchmarkDecodeSigsBig(b *testing.B) {
+	benchmarkDecode(b, [][]byte{bigDocument()}, func(in []byte, v any) error { return sigsyaml.Unmarshal(in, v) })
+}
+func BenchmarkDecodeOylManifests(b *testing.B) {
+	benchmarkDecode(b, testdataDocuments(b), oylUnmarshal)
+}
+func BenchmarkDecodeV3Manifests(b *testing.B) {
+	benchmarkDecode(b, testdataDocuments(b), yamlv3.Unmarshal)
+}
+func BenchmarkDecodeOylDir(b *testing.B) { benchmarkDecode(b, dirDocuments(b), oylUnmarshal) }
+func BenchmarkDecodeV3Dir(b *testing.B)  { benchmarkDecode(b, dirDocuments(b), yamlv3.Unmarshal) }
+func BenchmarkDecodeSigsDir(b *testing.B) {
+	benchmarkDecode(b, dirDocuments(b), func(in []byte, v any) error { return sigsyaml.Unmarshal(in, v) })
+}
+
+func BenchmarkEncodeOylBig(b *testing.B) { benchmarkEncode(b, [][]byte{bigDocument()}, Marshal) }
+func BenchmarkEncodeV3Big(b *testing.B)  { benchmarkEncode(b, [][]byte{bigDocument()}, yamlv3.Marshal) }
+func BenchmarkEncodeSigsBig(b *testing.B) {
+	benchmarkEncode(b, [][]byte{bigDocument()}, sigsyaml.Marshal)
+}
+func BenchmarkEncodeOylDir(b *testing.B) { benchmarkEncode(b, dirDocuments(b), Marshal) }
+func BenchmarkEncodeV3Dir(b *testing.B)  { benchmarkEncode(b, dirDocuments(b), yamlv3.Marshal) }

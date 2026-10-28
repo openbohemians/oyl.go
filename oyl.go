@@ -1,12 +1,15 @@
-// Package oyl converts YAML to JSON with Oyl, the optimized YAML library
-// (https://github.com/openbohemians/oyl), the way Kubernetes reads YAML.
+// Package oyl reads and writes YAML with Oyl, the optimized YAML library
+// (https://github.com/openbohemians/oyl).
 //
-// YAMLToJSON gives byte for byte the JSON of sigs.k8s.io/yaml's YAMLToJSON,
-// the function behind kubectl and client-go's YAML decoding: go-yaml v2's
-// types (yes and on are true, 0777 is octal), its merge-key order, keys
-// sorted, numbers and strings as Go's encoding/json writes them. Oyl does
-// it in C, in one call per document, about seven times as fast on real
-// manifests.
+// Unmarshal and Marshal, and Decoder and Encoder for streams, work as
+// go-yaml's do: Go values from YAML 1.2 (or YAML 1.1, or go-yaml v2's
+// types, WithDialect), and YAML from Go values that every reader reads
+// back the same. YAMLToJSON gives byte for byte the JSON of
+// sigs.k8s.io/yaml's YAMLToJSON, the function behind kubectl and
+// client-go's YAML decoding: go-yaml v2's types (yes and on are true, 0777
+// is octal), its merge-key order, keys sorted, numbers and strings as Go's
+// encoding/json writes them. Oyl does the work in C, in one call per
+// document, four to seven times as fast as go-yaml on real manifests.
 //
 // Oyl's C sources are vendored, so building needs only a C compiler (cgo).
 package oyl
@@ -75,7 +78,8 @@ import (
 	"unsafe"
 )
 
-// MaxDepth is the deepest nesting YAMLToJSON accepts, aliases expanded.
+// MaxDepth is the deepest nesting YAMLToJSON and Unmarshal accept, aliases
+// expanded, and Marshal writes.
 // go-yaml v2 allows 10,000; Oyl's parser recurses on some input, and cgo
 // runs it on threads whose stacks may be small, so the default is Oyl's.
 const MaxDepth = 256
