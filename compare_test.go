@@ -36,6 +36,9 @@ func TestSameAsSigsYAML(t *testing.T) {
 		})
 	}
 	t.Logf("%d files", n)
+	if n < 10 {
+		t.Errorf("only %d files compared", n)
+	}
 }
 
 func compare(t *testing.T, name string, in []byte, ours, theirs func([]byte) ([]byte, error)) {
