@@ -15,7 +15,7 @@ out, err := oyl.Marshal(cfg)
 json, err := oyl.YAMLToJSON(manifest)  // as Kubernetes reads YAML
 ```
 
-**Status:** it vendors Oyl 1.3.0; `c/COMMIT` names the commit. Oyl's work
+**Status:** it vendors Oyl 1.4.0; `c/COMMIT` names the commit. Oyl's work
 is done in C, one call per document. Its sources are vendored in `c/`, so
 building needs only a C compiler: cgo must be on (`CGO_ENABLED=1`, the
 default when not cross-compiling). It's tested on Linux, macOS and
@@ -170,7 +170,7 @@ came from. From a checkout of Oyl:
 
 ```sh
 scripts/sync-oyl.sh path/to/oyl          # its committed HEAD
-scripts/sync-oyl.sh path/to/oyl v1.3.0   # or a release tag
+scripts/sync-oyl.sh path/to/oyl v1.4.0   # or a release tag
 go test
 ```
 
