@@ -37,8 +37,10 @@ func (d Dialect) String() string {
 type Option func(*options)
 
 type options struct {
-	dialect     Dialect
-	knownFields bool
+	dialect        Dialect
+	knownFields    bool
+	keysKeepValue  bool // Upgrade's
+	valuesKeepText bool
 }
 
 // WithDialect types plain scalars by d. A document that starts with

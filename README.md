@@ -111,6 +111,28 @@ Where they can differ:
   key, anchor names cut at `:`, and text after the first document's root
   node ignored even when malformed. Each is malformed or rare YAML.
 
+## Upgrading YAML 1.1 to 1.2
+
+`oyl.Upgrade` makes a YAML 1.1 file read the same in YAML 1.2, rewriting
+only what a 1.2 reader would read otherwise and keeping every other byte:
+comments, layout, quoting, key order. Name the file's reader (`oyl.GoYAML2`
+for go-yaml v2 and Kubernetes, `oyl.YAML11` for PyYAML and Ansible), and
+afterwards the file reads the same in it and in YAML 1.2:
+
+```go
+out, fixes, err := oyl.Upgrade([]byte("enabled: yes\nmode: 0755\nid: y\n"), oyl.WithDialect(oyl.GoYAML2))
+// out: "enabled: true\nmode: 0o755\nid: true\n"
+for _, f := range fixes {
+    fmt.Printf("%d:%d %s -> %s  %s\n", f.Line, f.Column, f.Before, f.After, f.Message)
+}
+```
+
+Values keep the reader's meaning (`yes` was true), keys their text (`on:`
+is a name); `oyl.UpgradeKeysKeepValue()` and `oyl.UpgradeValuesKeepText()`
+flip either. Without `WithDialect`, what PyYAML and go-yaml v2 read alike
+is fixed, and what they read otherwise is reported (`Fixed` false), left
+for you.
+
 ## Speed
 
 ```sh
